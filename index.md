@@ -1,3 +1,7 @@
+## Low poly animations
+
+- [Ave Maria](nun/): a nun praying the rosary in a low poly church. She's a rigged Mixamo character posed in real time with three.js.
+
 ## Welcome to GitHub Pages
 
 You can use the [editor on GitHub](https://github.com/voracityz/voracityz-/edit/gh-pages/index.md) to maintain and preview the content for your website in Markdown files.
