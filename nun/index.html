@@ -1,0 +1,879 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ave Maria</title>
+<style>
+  :root {
+    --ink: #f3e9d6;
+    --ink-dim: rgba(243, 233, 214, 0.62);
+    --panel: rgba(18, 14, 12, 0.42);
+    --line: rgba(243, 233, 214, 0.18);
+  }
+  html, body { margin: 0; height: 100%; background: #0d0a09; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+  .overlay {
+    position: fixed; left: 24px; bottom: 22px; color: var(--ink);
+    font-family: "Cormorant Garamond", Georgia, "Times New Roman", serif;
+    pointer-events: none; text-shadow: 0 1px 8px rgba(0, 0, 0, 0.6);
+  }
+  .overlay h1 { margin: 0; font-weight: 500; font-size: 30px; letter-spacing: 0.04em; }
+  .overlay .prayer { margin-top: 4px; font-size: 17px; font-style: italic; color: var(--ink-dim); min-height: 1.3em; transition: opacity 0.6s; }
+  .controls { position: fixed; right: 20px; bottom: 20px; display: flex; gap: 8px; }
+  .controls button {
+    font: 13px/1 Georgia, serif; color: var(--ink); background: var(--panel);
+    border: 1px solid var(--line); border-radius: 999px; padding: 9px 14px; cursor: pointer;
+    backdrop-filter: blur(6px);
+  }
+  .controls button:hover { border-color: rgba(243, 233, 214, 0.4); }
+  .loading {
+    position: fixed; inset: 0; display: grid; place-items: center; color: var(--ink-dim);
+    font: italic 18px Georgia, serif; background: #0d0a09; transition: opacity 1.2s;
+  }
+  .credit { position: fixed; right: 22px; top: 16px; font: 11px Georgia, serif; color: rgba(243, 233, 214, 0.35); }
+  @media (max-width: 560px) {
+    .overlay { left: 16px; bottom: 70px; }
+    .overlay h1 { font-size: 24px; }
+    .controls { right: 16px; left: 16px; bottom: 16px; justify-content: flex-end; }
+  }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div class="loading" id="loading">lighting the candles…</div>
+<div class="overlay">
+  <h1>Ave Maria</h1>
+  <div class="prayer" id="prayer"></div>
+</div>
+<div class="controls">
+  <button id="camBtn" type="button">Free camera</button>
+</div>
+<div class="credit">Character: Michelle (Mixamo) · rigged &amp; posed in three.js</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const V = (x = 0, y = 0, z = 0) => new THREE.Vector3(x, y, z);
+const rand = mulberry32(7);
+function mulberry32(a) {
+  return () => {
+    a |= 0; a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const smooth = (e0, e1, x) => { const t = Math.min(1, Math.max(0, (x - e0) / (e1 - e0))); return t * t * (3 - 2 * t); };
+
+// ---------------------------------------------------------------- renderer
+const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.15;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x120d0b);
+scene.fog = new THREE.Fog(0x140f0c, 9, 30);
+
+const camera = new THREE.PerspectiveCamera(38, innerWidth / innerHeight, 0.03, 80);
+camera.position.set(-2, 1.6, -4);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 0.95, 0.2);
+controls.enableDamping = true;
+controls.enabled = false;
+controls.maxDistance = 18;
+
+// ---------------------------------------------------------------- materials
+const flat = (color, opts = {}) => new THREE.MeshStandardMaterial({ color, flatShading: true, roughness: 0.92, metalness: 0, ...opts });
+const M = {
+  plaster: flat(0xcbbba3),
+  stone: flat(0x9c8f7f),
+  stoneDark: flat(0x6f6458),
+  wood: flat(0x5a3a26),
+  woodDark: flat(0x3b261a),
+  marble: flat(0xe6e0d4, { roughness: 0.55 }),
+  red: flat(0x7c1a1c),
+  velvet: flat(0x5e1418),
+  gold: flat(0xc9a14a, { metalness: 0.75, roughness: 0.38 }),
+  linen: flat(0xf1ece2),
+  wax: flat(0xf3ead2, { roughness: 0.6 }),
+  habit: flat(0x16161b, { roughness: 0.97 }),
+  coif: flat(0xf2efe8, { roughness: 0.85 }),
+};
+
+// Flat shading everywhere is the low poly look; a little per-face colour jitter keeps big surfaces lively.
+function jitterColors(geo, base, amount = 0.05) {
+  geo = geo.index ? geo.toNonIndexed() : geo;
+  const pos = geo.attributes.position, cols = new Float32Array(pos.count * 3), c = new THREE.Color();
+  for (let i = 0; i < pos.count; i += 3) {
+    c.set(base).offsetHSL(0, 0, (rand() - 0.5) * amount * 2);
+    for (let k = 0; k < 3; k++) cols.set([c.r, c.g, c.b], (i + k) * 3);
+  }
+  geo.setAttribute('color', new THREE.BufferAttribute(cols, 3));
+  return geo;
+}
+function add(geo, mat, x = 0, y = 0, z = 0, { cast = true, receive = true, parent = scene } = {}) {
+  const m = new THREE.Mesh(geo, mat);
+  m.position.set(x, y, z);
+  m.castShadow = cast; m.receiveShadow = receive;
+  parent.add(m);
+  return m;
+}
+const box = (w, h, d) => new THREE.BoxGeometry(w, h, d);
+
+// ---------------------------------------------------------------- church
+// Nave runs along +Z toward the altar. The nun kneels at the communion rail at the origin.
+const NAVE = { x: 6, z0: -14, z1: 12, h: 8, ridge: 11.5 };
+
+{ // floor: checker of stone tiles, each one its own facet
+  const g = [], cols = [], s = 0.6, c = new THREE.Color();
+  for (let x = -NAVE.x; x < NAVE.x - 1e-6; x += s) for (let z = NAVE.z0; z < NAVE.z1 - 1e-6; z += s) {
+    const dark = (Math.round(x / s) + Math.round(z / s)) & 1;
+    c.set(dark ? 0x4a3d36 : 0xb9ab95).offsetHSL(0, 0, (rand() - 0.5) * 0.05);
+    const y = () => (rand() - 0.5) * 0.006;
+    const a = [x, y(), z], b = [x + s, y(), z], d = [x + s, y(), z + s], e = [x, y(), z + s];
+    g.push(...a, ...e, ...d, ...a, ...d, ...b);
+    for (let k = 0; k < 6; k++) cols.push(c.r, c.g, c.b);
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(g, 3));
+  geo.setAttribute('color', new THREE.Float32BufferAttribute(cols, 3));
+  geo.computeVertexNormals();
+  add(geo, flat(0xffffff, { vertexColors: true, roughness: 0.7 }), 0, 0, 0, { cast: false });
+  // red runner up the centre aisle
+  add(box(1.3, 0.012, 13.2), M.red, 0, 0.006, -7.6, { cast: false });
+}
+
+// Pointed (gothic) arch outline, used for window openings and their glass.
+function archShape(w, h, shape = new THREE.Shape()) {
+  const r = w * 0.9, spring = h - Math.sqrt(r * r - (r - w / 2) ** 2);
+  shape.moveTo(-w / 2, 0); shape.lineTo(w / 2, 0); shape.lineTo(w / 2, spring);
+  shape.absarc(w / 2 - r, spring, r, 0, Math.acos((r - w / 2) / r), false);
+  shape.absarc(-w / 2 + r, spring, r, Math.PI - Math.acos((r - w / 2) / r), Math.PI, false);
+  shape.lineTo(-w / 2, 0);
+  return shape;
+}
+const WIN = { w: 1.3, h: 3.4, sill: 3.1, zs: [-11.3, -6.8, -2.3, 2.2] };
+const STAINED = [0x2c4fb8, 0xb3242a, 0xe0a72c, 0x2f8a52, 0x6b3aa0, 0x2d79b5, 0xd9622b, 0xe9d8a6];
+
+// Stained glass: a mosaic of triangles inside the arch, each shrunk a little so the dark backing reads as lead.
+function stainedGlass(w, h, seed) {
+  const pr = mulberry32(seed), shape = archShape(w, h), pts = shape.getPoints(24).map(p => [p.x, p.y]);
+  const inside = (x, y) => { // point-in-polygon
+    let c = false;
+    for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+      const [xi, yi] = pts[i], [xj, yj] = pts[j];
+      if ((yi > y) !== (yj > y) && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) c = !c;
+    }
+    return c;
+  };
+  const pos = [], col = [], c = new THREE.Color(), cols = 5, rows = 13, cw = w / cols, rh = h / rows;
+  for (let i = 0; i < cols; i++) for (let j = 0; j < rows; j++) {
+    const x0 = -w / 2 + i * cw, y0 = j * rh;
+    const tris = (i + j) & 1
+      ? [[[x0, y0], [x0 + cw, y0], [x0 + cw, y0 + rh]], [[x0, y0], [x0 + cw, y0 + rh], [x0, y0 + rh]]]
+      : [[[x0, y0], [x0 + cw, y0], [x0, y0 + rh]], [[x0 + cw, y0], [x0 + cw, y0 + rh], [x0, y0 + rh]]];
+    for (const t of tris) {
+      const cx = (t[0][0] + t[1][0] + t[2][0]) / 3, cy = (t[0][1] + t[1][1] + t[2][1]) / 3;
+      if (!t.every(([x, y]) => inside(x * 0.999, y * 0.999 + 0.0005)) && !inside(cx, cy)) continue;
+      const centre = Math.abs(cx) < w * 0.2 && cy > h * 0.25 && cy < h * 0.7;
+      c.set(centre ? (pr() < 0.6 ? 0xe9d8a6 : 0xe0a72c) : STAINED[Math.floor(pr() * 6)]).offsetHSL(0, 0, (pr() - 0.5) * 0.12);
+      for (const [x, y] of t) {
+        const sx = cx + (x - cx) * 0.84, sy = cy + (y - cy) * 0.84;
+        if (!inside(sx, sy)) continue;
+        pos.push(sx, sy, 0);
+      }
+      while (pos.length % 9) pos.pop();
+      while (col.length < pos.length) col.push(c.r, c.g, c.b);
+    }
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  geo.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+  const glass = new THREE.Group();
+  glass.add(new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide, toneMapped: false })));
+  const lead = new THREE.Mesh(new THREE.ShapeGeometry(archShape(w, h)), new THREE.MeshBasicMaterial({ color: 0x0b0806, side: THREE.DoubleSide }));
+  lead.position.z = -0.01;
+  glass.add(lead);
+  return glass;
+}
+
+{ // side walls with window openings, so the sun only gets in through the glass
+  const len = NAVE.z1 - NAVE.z0, thick = 0.5;
+  for (const side of [-1, 1]) {
+    const shape = new THREE.Shape();
+    const za = NAVE.z0 - 0.6, zb = NAVE.z1 + 0.6; // overlap the end walls so no sunlight leaks through the corners
+    shape.moveTo(za, 0); shape.lineTo(zb, 0); shape.lineTo(zb, NAVE.h + 0.4); shape.lineTo(za, NAVE.h + 0.4); shape.lineTo(za, 0);
+    for (const z of WIN.zs) {
+      const pts = archShape(WIN.w, WIN.h).getPoints(24).map(p => new THREE.Vector2(p.x + z, p.y + WIN.sill));
+      shape.holes.push(new THREE.Path(pts));
+    }
+    const geo = new THREE.ExtrudeGeometry(shape, { depth: thick, bevelEnabled: false });
+    const wall = add(jitterColors(geo, 0xcbbba3, 0.03), flat(0xffffff, { vertexColors: true }));
+    wall.rotation.y = -Math.PI / 2;
+    wall.position.x = side < 0 ? -NAVE.x : NAVE.x + thick;
+    // stone dado along the bottom
+    add(box(0.12, 1.1, len), M.stone, side * (NAVE.x - 0.06), 0.55, (NAVE.z0 + NAVE.z1) / 2);
+    for (const [k, z] of WIN.zs.entries()) {
+      const g = stainedGlass(WIN.w, WIN.h, 11 + k * 7 + (side + 1) * 31);
+      g.rotation.y = side * -Math.PI / 2;
+      g.position.set(side * (NAVE.x + 0.25), WIN.sill, z);
+      g.traverse(o => { o.castShadow = false; });
+      scene.add(g);
+      if (side > 0) g.children[0].material = new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide, color: 0x6f7a9a });
+      // deep stone reveal around each window
+      add(box(0.55, 0.14, WIN.w + 0.3), M.stone, side * (NAVE.x + 0.2), WIN.sill - 0.07, z);
+    }
+  }
+  // east wall with a rose window above the altar
+  const east = new THREE.Shape();
+  east.moveTo(-NAVE.x - 0.5, 0); east.lineTo(NAVE.x + 0.5, 0); east.lineTo(NAVE.x + 0.5, NAVE.h); east.lineTo(0, NAVE.ridge); east.lineTo(-NAVE.x - 0.5, NAVE.h);
+  east.holes.push(new THREE.Path().absarc(0, 6.6, 1.75, 0, Math.PI * 2, true));
+  add(jitterColors(new THREE.ExtrudeGeometry(east, { depth: 0.5, bevelEnabled: false }), 0xcbbba3, 0.03), flat(0xffffff, { vertexColors: true }), 0, 0, NAVE.z1);
+  const west = new THREE.Shape();
+  west.moveTo(-NAVE.x - 0.5, 0); west.lineTo(NAVE.x + 0.5, 0); west.lineTo(NAVE.x + 0.5, NAVE.h); west.lineTo(0, NAVE.ridge); west.lineTo(-NAVE.x - 0.5, NAVE.h);
+  add(new THREE.ExtrudeGeometry(west, { depth: 0.5, bevelEnabled: false }), M.plaster, 0, 0, NAVE.z0 - 0.5);
+
+  // rose window: rings of wedges
+  const pos = [], col = [], c = new THREE.Color(), pr = mulberry32(99);
+  const rings = [[0, 0.35, 6], [0.35, 0.9, 12], [0.9, 1.35, 24], [1.35, 1.72, 24]];
+  rings.forEach(([r0, r1, n], ri) => {
+    for (let i = 0; i < n; i++) {
+      const a0 = (i / n) * Math.PI * 2, a1 = ((i + 1) / n) * Math.PI * 2, am = (a0 + a1) / 2, rm = (r0 + r1) / 2;
+      const pt = (r, a) => [Math.cos(a) * r, Math.sin(a) * r];
+      const quad = r0 === 0 ? [[pt(0, 0), pt(r1, a0), pt(r1, a1)]] : [[pt(r0, a0), pt(r1, a0), pt(r1, a1)], [pt(r0, a0), pt(r1, a1), pt(r0, a1)]];
+      const tint = ri === 0 ? 0xe0a72c : ri === 1 ? (i % 2 ? 0xb3242a : 0x2c4fb8) : STAINED[(i + ri) % 6];
+      c.set(tint).offsetHSL(0, 0, (pr() - 0.5) * 0.12);
+      const cx = Math.cos(am) * rm, cy = Math.sin(am) * rm;
+      for (const t of quad) for (const [x, y] of t) { pos.push(cx + (x - cx) * 0.86, cy + (y - cy) * 0.86, 0); col.push(c.r, c.g, c.b); }
+    }
+  });
+  const rg = new THREE.BufferGeometry();
+  rg.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  rg.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+  const rose = new THREE.Mesh(rg, new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide, toneMapped: false, color: 0xbfb5a8 }));
+  rose.position.set(0, 6.6, NAVE.z1 + 0.25);
+  scene.add(rose);
+  const backing = new THREE.Mesh(new THREE.CircleGeometry(1.75, 24), new THREE.MeshBasicMaterial({ color: 0x0b0806 }));
+  backing.position.set(0, 6.6, NAVE.z1 + 0.3);
+  scene.add(backing);
+}
+
+{ // gabled roof and beams
+  const span = Math.hypot(NAVE.x + 0.5, NAVE.ridge - NAVE.h), ang = Math.atan2(NAVE.ridge - NAVE.h, NAVE.x + 0.5);
+  for (const side of [-1, 1]) {
+    const r = add(box(span + 0.4, 0.3, NAVE.z1 - NAVE.z0 + 1), M.woodDark, side * (NAVE.x + 0.5) / 2, (NAVE.h + NAVE.ridge) / 2 + 0.15, (NAVE.z0 + NAVE.z1) / 2);
+    r.rotation.z = -side * ang;
+  }
+  for (let z = NAVE.z0 + 1; z < NAVE.z1; z += 2.6) {
+    add(box(NAVE.x * 2, 0.28, 0.24), M.wood, 0, NAVE.h - 0.1, z);
+    add(box(0.22, NAVE.ridge - NAVE.h - 0.2, 0.22), M.wood, 0, (NAVE.h + NAVE.ridge) / 2 - 0.1, z);
+  }
+}
+
+{ // columns
+  const shaft = new THREE.CylinderGeometry(0.26, 0.28, 6.7, 8);
+  const cap = new THREE.CylinderGeometry(0.42, 0.28, 0.45, 8);
+  const base = new THREE.CylinderGeometry(0.38, 0.42, 0.4, 8);
+  for (const side of [-1, 1]) for (let z = -9.05; z < 6; z += 4.5) {
+    const x = side * 5.05;
+    add(base, M.stone, x, 0.2, z);
+    add(shaft, M.stone, x, 3.75, z);
+    add(cap, M.stone, x, 7.3, z);
+  }
+}
+
+{ // pews
+  const seat = box(3.5, 0.06, 0.42), back = box(3.5, 0.5, 0.05), end = box(0.07, 0.95, 0.6), kneel = box(3.4, 0.08, 0.14);
+  for (let z = -2.4; z > -12.6; z -= 1.15) for (const side of [-1, 1]) {
+    const cx = side * 2.75;
+    add(seat, M.wood, cx, 0.45, z);
+    add(back, M.wood, cx, 0.78, z - 0.2);
+    add(end, M.woodDark, cx - 1.78, 0.48, z - 0.02);
+    add(end, M.woodDark, cx + 1.78, 0.48, z - 0.02);
+    add(kneel, M.woodDark, cx, 0.12, z + 0.42);
+  }
+}
+
+// ---------------------------------------------------------------- sanctuary
+const flames = [];
+function candle(x, y, z, h = 0.32, r = 0.025, parent = scene) {
+  add(new THREE.CylinderGeometry(r, r, h, 6), M.wax, x, y + h / 2, z, { parent });
+  const f = new THREE.Mesh(new THREE.ConeGeometry(r * 0.55, r * 2.6, 5), new THREE.MeshBasicMaterial({ color: 0xffc46b, toneMapped: false }));
+  f.position.set(x, y + h + r * 1.4, z);
+  parent.add(f);
+  flames.push({ mesh: f, base: f.position.y, seed: rand() * 100 });
+}
+{
+  // steps and platform
+  add(box(9, 0.15, 0.5), M.marble, 0, 0.075, 5.75);
+  add(box(9, 0.3, 0.5), M.marble, 0, 0.15, 6.25);
+  add(box(NAVE.x * 2, 0.45, 5.6), M.stoneDark, 0, 0.225, 9.3);
+  // altar
+  add(box(2.6, 1.0, 1.0), M.marble, 0, 0.95, 9.2);
+  add(box(2.72, 0.04, 1.08), M.linen, 0, 1.47, 9.2);
+  add(box(2.74, 0.36, 0.02), M.linen, 0, 1.3, 8.66);
+  add(box(1.1, 0.5, 0.02), M.red, 0, 1.08, 8.68);
+  add(box(0.06, 0.34, 0.025), M.gold, 0, 1.08, 8.665);
+  add(box(0.24, 0.06, 0.025), M.gold, 0, 1.15, 8.665);
+  // tabernacle
+  add(box(0.5, 0.55, 0.4), M.gold, 0, 1.765, 9.45);
+  add(new THREE.ConeGeometry(0.36, 0.3, 4), M.gold, 0, 2.19, 9.45).rotation.y = Math.PI / 4;
+  // reredos panel behind
+  add(box(4.2, 3.6, 0.3), M.woodDark, 0, 2.25, 11.6);
+  add(box(3.6, 3.0, 0.08), M.red, 0, 2.3, 11.43);
+  // hanging crucifix
+  add(box(0.14, 2.2, 0.1), M.woodDark, 0, 4.2, 10.4);
+  add(box(1.3, 0.14, 0.1), M.woodDark, 0, 4.75, 10.4);
+  add(box(0.09, 0.62, 0.08), M.marble, 0, 4.45, 10.33);
+  add(box(0.86, 0.07, 0.07), M.marble, 0, 4.73, 10.33);
+  add(new THREE.IcosahedronGeometry(0.07, 0), M.marble, 0, 4.86, 10.31);
+  // altar candles
+  for (const x of [-1.1, -0.75, -0.4, 0.4, 0.75, 1.1]) {
+    add(new THREE.CylinderGeometry(0.05, 0.08, 0.08, 6), M.gold, x, 1.53, 9.4);
+    candle(x, 1.57, 9.4, 0.42 - Math.abs(x) * 0.12, 0.028);
+  }
+  // communion rail in front of the nun
+  const rail = new THREE.Group();
+  for (const side of [-1, 1]) {
+    add(box(3.9, 0.08, 0.24), M.marble, side * 2.55, 0.76, 0.62, { parent: rail });
+    add(box(3.9, 0.12, 0.3), M.marble, side * 2.55, 0.06, 0.62, { parent: rail });
+    for (let i = 0; i < 9; i++) {
+      const x = side * (0.75 + i * 0.45);
+      add(new THREE.CylinderGeometry(0.045, 0.065, 0.6, 6), M.marble, x, 0.42, 0.62, { parent: rail });
+    }
+  }
+  add(box(0.06, 0.75, 0.06), M.marble, 0.58, 0.4, 0.62, { parent: rail });
+  add(box(0.06, 0.75, 0.06), M.marble, -0.58, 0.4, 0.62, { parent: rail });
+  scene.add(rail);
+  // kneeler cushion
+  add(box(1.0, 0.1, 1.25), M.woodDark, 0, 0.05, -0.24);
+  add(box(0.94, 0.045, 1.19), M.velvet, 0, 0.12, -0.24);
+  // votive stand
+  const vx = 3.4, vz = 3.4;
+  add(box(1.4, 0.8, 0.5), M.woodDark, vx, 0.4, vz);
+  add(box(1.4, 0.12, 0.36), M.woodDark, vx, 0.86, vz + 0.1);
+  for (let r = 0; r < 2; r++) for (let i = 0; i < 7; i++) {
+    if (rand() < 0.25) continue;
+    const x = vx - 0.6 + i * 0.2, y = r ? 0.92 : 0.8, z = vz + (r ? 0.1 : -0.15);
+    add(new THREE.CylinderGeometry(0.035, 0.03, 0.06, 6), flat(0x8a1b1d, { transparent: true, opacity: 0.85 }), x, y + 0.03, z);
+    candle(x, y + 0.02, z, 0.04, 0.02);
+  }
+  // Marian statue on a plinth to the left of the sanctuary
+  const sx = -3.6, sz = 5.0;
+  add(box(0.7, 1.2, 0.7), M.marble, sx, 0.6, sz);
+  add(new THREE.CylinderGeometry(0.14, 0.32, 1.25, 7), flat(0xe8e2d6), sx, 1.82, sz);
+  add(new THREE.CylinderGeometry(0.12, 0.17, 0.38, 7), flat(0x4f6fa8), sx, 2.18, sz);
+  add(new THREE.IcosahedronGeometry(0.11, 0), flat(0xe9dccb), sx, 2.55, sz);
+  add(new THREE.TorusGeometry(0.16, 0.012, 4, 14), M.gold, sx, 2.6, sz - 0.05);
+  for (const x of [-0.25, 0.25]) candle(sx + x, 1.2, sz - 0.3, 0.28, 0.025);
+}
+
+// ---------------------------------------------------------------- lighting
+scene.add(new THREE.HemisphereLight(0x9aa6c4, 0x3a2a20, 0.55));
+const SUN_DIR = V(1, -0.72, 0.33).normalize();
+const sun = new THREE.DirectionalLight(0xffe2b0, 5.5);
+sun.position.copy(SUN_DIR).multiplyScalar(-22).add(V(0, 0, -1));
+sun.target.position.set(0, 0, -1);
+sun.castShadow = true;
+sun.shadow.mapSize.set(4096, 4096);
+Object.assign(sun.shadow.camera, { left: -17, right: 17, top: 17, bottom: -17, near: 1, far: 50 });
+sun.shadow.bias = -0.0004;
+sun.shadow.normalBias = 0.02;
+scene.add(sun, sun.target);
+
+const altarGlow = new THREE.PointLight(0xffb565, 2.2, 7, 1.6);
+altarGlow.position.set(0, 2.2, 8.7);
+const votiveGlow = new THREE.PointLight(0xff9b4a, 1.6, 4, 1.8);
+votiveGlow.position.set(3.4, 1.3, 3.0);
+const statueGlow = new THREE.PointLight(0xffaa55, 0.6, 3.5, 1.8);
+statueGlow.position.set(-3.4, 1.5, 4.2);
+scene.add(altarGlow, votiveGlow, statueGlow);
+// soft key light so her face and hands read in close-ups
+const key = new THREE.SpotLight(0xffd6a0, 9, 6, 0.42, 0.9, 1.5);
+key.position.set(0.9, 3.2, 2.3);
+key.target.position.set(0, 0.9, 0.1);
+scene.add(key, key.target);
+
+// God rays through the sunlit windows: open prisms faded along their length.
+const rayMat = new THREE.ShaderMaterial({
+  transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, side: THREE.DoubleSide,
+  uniforms: { uTime: { value: 0 } },
+  vertexShader: `attribute float along; attribute vec3 tint; varying float vAlong; varying vec3 vTint; varying vec3 vN; varying vec3 vView;
+    void main(){ vAlong = along; vTint = tint; vec4 mv = modelViewMatrix * vec4(position,1.); vN = normalize(normalMatrix*normal); vView = normalize(-mv.xyz); gl_Position = projectionMatrix*mv; }`,
+  fragmentShader: `uniform float uTime; varying float vAlong; varying vec3 vTint; varying vec3 vN; varying vec3 vView;
+    void main(){ float edge = pow(abs(dot(normalize(vN), vView)), 1.6);
+      float a = smoothstep(0., .06, vAlong) * pow(1. - vAlong, 1.7) * edge * (0.85 + 0.15*sin(uTime*.5 + vAlong*6.));
+      gl_FragColor = vec4(vTint * a * 0.16, 1.); }`,
+});
+{
+  const pos = [], along = [], tint = [], L = 12, c = new THREE.Color();
+  for (const z of WIN.zs) {
+    const corners = [[z - WIN.w / 2, WIN.sill], [z + WIN.w / 2, WIN.sill], [z + WIN.w / 2, WIN.sill + WIN.h * 0.95], [z - WIN.w / 2, WIN.sill + WIN.h * 0.95]]
+      .map(([zz, y]) => V(-NAVE.x + 0.1, y, zz));
+    c.set(0xffd9a0);
+    for (let i = 0; i < 4; i++) {
+      const a = corners[i], b = corners[(i + 1) % 4];
+      const a2 = a.clone().addScaledVector(SUN_DIR, L), b2 = b.clone().addScaledVector(SUN_DIR, L);
+      for (const [p, t] of [[a, 0], [b, 0], [b2, 1], [a, 0], [b2, 1], [a2, 1]]) { pos.push(p.x, p.y, p.z); along.push(t); tint.push(c.r, c.g, c.b); }
+    }
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('along', new THREE.Float32BufferAttribute(along, 1));
+  g.setAttribute('tint', new THREE.Float32BufferAttribute(tint, 3));
+  g.computeVertexNormals();
+  const rays = new THREE.Mesh(g, rayMat);
+  rays.renderOrder = 10;
+  scene.add(rays);
+}
+// dust drifting in the light
+const DUST = 700;
+const dustGeo = new THREE.BufferGeometry();
+const dustSeed = new Float32Array(DUST * 4);
+for (let i = 0; i < DUST; i++) {
+  const t = rand() * 9, z = WIN.zs[2 + (i % 2)] + (rand() - 0.5) * 1.6, y = WIN.sill + rand() * WIN.h;
+  const p = V(-NAVE.x, y, z).addScaledVector(SUN_DIR, t);
+  dustSeed.set([p.x, p.y, p.z, rand() * 100], i * 4);
+}
+dustGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(DUST * 3), 3));
+const moteTex = (() => {
+  const c = document.createElement('canvas'); c.width = c.height = 32;
+  const g = c.getContext('2d'), grad = g.createRadialGradient(16, 16, 0, 16, 16, 16);
+  grad.addColorStop(0, 'rgba(255,255,255,1)'); grad.addColorStop(0.35, 'rgba(255,255,255,0.35)'); grad.addColorStop(1, 'rgba(255,255,255,0)');
+  g.fillStyle = grad; g.fillRect(0, 0, 32, 32);
+  return new THREE.CanvasTexture(c);
+})();
+const dust = new THREE.Points(dustGeo, new THREE.PointsMaterial({ color: 0xffe6b8, map: moteTex, size: 0.03, transparent: true, opacity: 0.5, depthWrite: false, blending: THREE.AdditiveBlending }));
+scene.add(dust);
+
+// ---------------------------------------------------------------- the nun
+const ROSARY = { beads: 55, slots: 57, period: 3.4 };
+let rig = null;
+
+new GLTFLoader().load('Michelle.glb', gltf => {
+  const model = gltf.scene;
+  scene.add(model);
+  model.updateMatrixWorld(true);
+  let body;
+  model.traverse(o => { if (o.isSkinnedMesh) body = o; });
+  body.castShadow = true; body.receiveShadow = true; body.frustumCulled = false;
+  const bones = {};
+  body.skeleton.bones.forEach(b => { bones[b.name.replace(/^mixamorig:?/, '')] = b; });
+  restyleBody(body, bones);
+  rig = buildRig(bones);
+  dressNun(bones);
+  rig.pose(0);
+  dressSkirt(bones);
+  document.getElementById('loading').style.opacity = 0;
+  setTimeout(() => document.getElementById('loading').remove(), 1300);
+}, undefined, err => {
+  document.getElementById('loading').textContent = 'Could not load the character model.';
+  console.error(err);
+});
+
+// Swap the photo-textured outfit for flat colours: skin on the face and hands, black habit everywhere else.
+function restyleBody(body, bones) {
+  const geo = body.geometry, n = geo.attributes.position.count;
+  const si = geo.attributes.skinIndex, sw = geo.attributes.skinWeight, cols = new Float32Array(n * 3), texMix = new Float32Array(n);
+  const skin = new THREE.Color(0xe2b8a0), habit = new THREE.Color(0x16161b), white = new THREE.Color(0xf2efe8);
+  const names = body.skeleton.bones.map(b => b.name.replace(/^mixamorig:?/, ''));
+  for (let i = 0; i < n; i++) {
+    let best = 0, bw = -1;
+    for (let k = 0; k < 4; k++) { const w = sw.getComponent(i, k); if (w > bw) { bw = w; best = si.getComponent(i, k); } }
+    const name = names[best];
+    const bare = /Hand|Head/.test(name);
+    const c = bare ? skin : /Neck/.test(name) ? white : habit;
+    cols.set(bare ? [1, 1, 1] : [c.r, c.g, c.b], i * 3);
+    texMix[i] = bare ? 1 : 0;
+  }
+  if (tuckHair(geo.attributes.position)) for (let i = HAIR[0]; i < HAIR[1]; i++) { // hair becomes the white under-cap
+    cols.set([white.r, white.g, white.b], i * 3); texMix[i] = 0;
+  }
+  geo.attributes.position.needsUpdate = true;
+  geo.computeVertexNormals();
+  geo.computeBoundingSphere();
+  geo.setAttribute('color', new THREE.BufferAttribute(cols, 3));
+  geo.setAttribute('texMix', new THREE.BufferAttribute(texMix, 1));
+  // face and hands keep the character's own skin texture; the rest is flat-coloured habit
+  const mat = new THREE.MeshStandardMaterial({ vertexColors: true, flatShading: true, roughness: 0.85, map: body.material.map });
+  mat.onBeforeCompile = sh => {
+    sh.vertexShader = 'attribute float texMix;\nvarying float vTexMix;\n' + sh.vertexShader.replace('#include <uv_vertex>', '#include <uv_vertex>\nvTexMix = texMix;');
+    sh.fragmentShader = 'varying float vTexMix;\n' + sh.fragmentShader.replace('#include <map_fragment>',
+      'vec4 texel = texture2D(map, vMapUv);\ndiffuseColor.rgb = mix(diffuseColor.rgb, texel.rgb, vTexMix);');
+  };
+  body.material = mat;
+}
+
+// Michelle's big hairdo would poke through the veil, so it is squeezed into a skull-sized egg,
+// and her sunglasses are collapsed away. Both are separate islands in this model's vertex buffer.
+// (The bind pose is the T-pose at the origin, so geometry space is world space here.)
+const SKULL = { c: V(0, 1.5, -0.005), rx: 0.092, up: 0.108, down: 0.2, front: 0.075, back: 0.1 };
+const HAIR = [7078, 9238], GLASSES = [9238, 9949];
+function tuckHair(pos) {
+  if (pos.count !== 16340) return false; // only for the bundled Michelle.glb
+  for (let i = HAIR[0]; i < HAIR[1]; i++) {
+    const d = V(pos.getX(i), pos.getY(i), pos.getZ(i)).sub(SKULL.c);
+    const e = V(d.x / SKULL.rx, d.y / (d.y > 0 ? SKULL.up : SKULL.down), d.z / (d.z > 0 ? SKULL.front : SKULL.back));
+    const k = e.length();
+    if (k > 1) { d.divideScalar(k); pos.setXYZ(i, SKULL.c.x + d.x, SKULL.c.y + d.y, SKULL.c.z + d.z); }
+  }
+  for (let i = GLASSES[0]; i < GLASSES[1]; i++) pos.setXYZ(i, 0, 1.47, -0.02);
+  return true;
+}
+
+// Rigid pieces of the habit ride on the bones they belong to.
+function dressNun(bones) {
+  scene.updateMatrixWorld(true);
+  const r = 0.11, H = SKULL.c.clone().add(V(0, 0, -0.012));
+  const lathe = (pts, mat, phiStart = 0, phiLen = Math.PI * 2, seg = 12) => {
+    const g = new THREE.LatheGeometry(pts.map(([x, y]) => new THREE.Vector2(x * r, y * r)), seg, phiStart, phiLen);
+    const m = new THREE.Mesh(g, mat);
+    m.material.side = THREE.DoubleSide;
+    m.castShadow = true; m.receiveShadow = true;
+    m.position.copy(H);
+    m.scale.set(1, 1, 0.86);
+    return m;
+  };
+  const gap = 1.95, gapInner = 1.35;
+  // black veil: closed crown, open at the face, falling to the shoulders
+  const veilCap = lathe([[0, 1.18], [0.5, 1.12], [0.9, 0.9], [1.1, 0.6], [1.18, 0.35]], M.habit);
+  const veil = lathe([[1.18, 0.35], [1.2, -0.1], [1.25, -0.6], [1.36, -1.1], [1.55, -1.6], [1.85, -2.1]], M.habit, gap / 2, Math.PI * 2 - gap);
+  // white coif peeking out along the face opening, and the forehead band
+  const coif = lathe([[1.1, 0.4], [1.12, -0.1], [1.15, -0.6], [1.22, -1.05], [1.38, -1.5]], M.coif, gapInner / 2, Math.PI * 2 - gapInner);
+  const band = lathe([[1.07, 0.66], [1.09, 0.5], [1.1, 0.3]], M.coif);
+  for (const m of [veilCap, veil, coif, band]) bones.Head.attach(m);
+  // wimple / bib over the neck and chest, and the long back drape of the veil, on the upper spine
+  const wimple = lathe([[0.6, -0.85], [0.68, -1.2], [0.88, -1.6], [1.3, -1.95], [1.62, -2.15]], M.coif);
+  const drape = lathe([[1.7, -1.9], [2.1, -2.45], [2.35, -3.3], [2.4, -4.4]], M.habit, Math.PI * 0.62, Math.PI * 0.76, 10);
+  for (const m of [wimple, drape]) bones.Spine2.attach(m);
+  // wide sleeves, hung on the forearms
+  for (const side of ['Left', 'Right']) {
+    const fa = bones[side + 'ForeArm'], hand = bones[side + 'Hand'];
+    const a = fa.getWorldPosition(V()), b = hand.getWorldPosition(V()), len = a.distanceTo(b);
+    const g = new THREE.CylinderGeometry(0.05, 0.072, len * 0.9, 8, 1, true);
+    g.translate(0, len * 0.45, 0);
+    const s = new THREE.Mesh(g, M.habit);
+    s.material.side = THREE.DoubleSide;
+    s.castShadow = true;
+    s.position.copy(b).lerp(a, 0.05);
+    s.quaternion.setFromUnitVectors(V(0, 1, 0), a.clone().sub(b).normalize());
+    fa.attach(s);
+  }
+}
+
+// The habit's skirt is shaped around the kneeling pose and rides on the hips.
+function dressSkirt(bones) {
+  const pr = mulberry32(3), seg = 16;
+  const rings = [ // y, centre z, half-width, half-depth, fold noise
+    [0.8, -0.1, 0.14, 0.12, 0], [0.64, -0.1, 0.2, 0.16, 0.02], [0.44, -0.1, 0.23, 0.2, 0.04],
+    [0.26, -0.2, 0.26, 0.34, 0.06], [0.16, -0.3, 0.29, 0.46, 0.08], [0.145, -0.31, 0.31, 0.48, 0.05],
+  ];
+  const pos = [];
+  for (const [y, cz, rx, rz, n] of rings) for (let i = 0; i < seg; i++) {
+    const a = (i / seg) * Math.PI * 2, k = 1 + (pr() - 0.5) * 2 * n;
+    pos.push(Math.sin(a) * rx * k, y + (pr() - 0.5) * n * 0.2, cz + Math.cos(a) * rz * k);
+  }
+  const idx = [];
+  for (let r = 0; r < rings.length - 1; r++) for (let i = 0; i < seg; i++) {
+    const a = r * seg + i, b = r * seg + (i + 1) % seg, c = a + seg, d = b + seg;
+    idx.push(a, c, b, b, c, d);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setIndex(idx);
+  g.computeVertexNormals();
+  const skirt = new THREE.Mesh(g, M.habit);
+  skirt.castShadow = true; skirt.receiveShadow = true;
+  scene.add(skirt);
+  bones.Hips.attach(skirt);
+}
+
+// ---------------------------------------------------------------- posing
+// Every frame the skeleton is rebuilt from its rest pose: each bone is given a world-space
+// direction (towards its child) plus a secondary "facing" direction, then converted to local space.
+function buildRig(bones) {
+  scene.updateMatrixWorld(true);
+  const info = {};
+  const restRef = name => /Thumb/.test(name) ? V(0, -1, 0)
+    : /Foot/.test(name) ? V(0, 1, 0)
+    : V(0, 0, 1);
+  for (const [name, b] of Object.entries(bones)) {
+    const child = b.children.find(c => c.isBone);
+    const wq = b.getWorldQuaternion(new THREE.Quaternion()), inv = wq.clone().invert();
+    const p0 = b.getWorldPosition(V());
+    const lp = child ? child.getWorldPosition(V()).sub(p0).normalize().applyQuaternion(inv) : V(0, 1, 0);
+    const ls = restRef(name).applyQuaternion(inv);
+    info[name] = { bone: b, child, restQ: b.quaternion.clone(), restP: b.position.clone(), lp, ls, len: child ? child.getWorldPosition(V()).distanceTo(p0) : 0, restLocal: basisQ(lp, ls).invert() };
+  }
+  const hipsY0 = bones.Hips.getWorldPosition(V()).y, upLegY0 = bones.LeftUpLeg.getWorldPosition(V()).y;
+  return { bones, info, hipOffset: hipsY0 - upLegY0, pose: t => posePrayer(info, bones, t, hipsY0 - upLegY0) };
+}
+
+const _m = new THREE.Matrix4(), _x = V(), _y = V(), _z = V();
+function basisQ(p, s) {
+  _x.copy(p).normalize();
+  _z.crossVectors(_x, s);
+  if (_z.lengthSq() < 1e-8) _z.crossVectors(_x, Math.abs(_x.y) < 0.9 ? V(0, 1, 0) : V(1, 0, 0));
+  _z.normalize();
+  _y.crossVectors(_z, _x);
+  return new THREE.Quaternion().setFromRotationMatrix(_m.makeBasis(_x, _y, _z));
+}
+const _pq = new THREE.Quaternion();
+function orient(I, primary, secondary) {
+  const w = basisQ(primary, secondary).multiply(I.restLocal);
+  I.bone.parent.getWorldQuaternion(_pq);
+  I.bone.quaternion.copy(_pq.invert().multiply(w));
+  I.bone.updateMatrixWorld(true);
+}
+const rot = (v, axis, ang) => v.clone().applyAxisAngle(axis, ang);
+const X = V(1, 0, 0), Y = V(0, 1, 0), Z = V(0, 0, 1);
+
+function posePrayer(info, bones, t, hipOffset) {
+  for (const I of Object.values(info)) { I.bone.quaternion.copy(I.restQ); I.bone.position.copy(I.restP); }
+  const breath = Math.sin(t * (Math.PI * 2) / 4.8);
+  const bead = beadPhase(t);
+
+  // hips: kneeling upright on the cushion
+  const thigh = info.LeftUpLeg.len, shin = info.LeftLeg.len;
+  const kneeY = 0.19, lean = 0.12;
+  const hipsW = V(0, kneeY + thigh * Math.cos(lean) + hipOffset, -0.06 - thigh * Math.sin(lean));
+  bones.Hips.parent.updateMatrixWorld(true);
+  bones.Hips.position.copy(bones.Hips.parent.worldToLocal(hipsW.clone()));
+  bones.Hips.updateMatrixWorld(true);
+  orient(info.Hips, rot(Y, X, 0.06), rot(Z, X, 0.06));
+
+  // legs: thighs down to the cushion, shins and feet lying back along it
+  for (const s of ['Left', 'Right']) {
+    const sx = s === 'Left' ? 1 : -1;
+    orient(info[s + 'UpLeg'], V(0.04 * sx, -Math.cos(lean), Math.sin(lean)), Z);
+    orient(info[s + 'Leg'], V(0.03 * sx, -0.08, -1).normalize(), V(0, -1, 0));
+    orient(info[s + 'Foot'], V(0, -0.25, -1).normalize(), V(0, -1, 0.3));
+  }
+
+  // spine bowed a little forward, breathing
+  const sp = [0.05 + breath * 0.01, 0.07 + breath * 0.012, 0.06];
+  ['Spine', 'Spine1', 'Spine2'].forEach((n, i) => {
+    const a = sp.slice(0, i + 1).reduce((p, c) => p + c, 0);
+    orient(info[n], rot(Y, X, a), rot(Z, X, a));
+  });
+  // head bowed in prayer, with a slow nod at each new bead
+  const nod = 0.04 * Math.sin(Math.min(1, bead.f / 0.35) * Math.PI);
+  const neckA = 0.16, headA = 0.34 + 0.04 * Math.sin(t * 0.23) + nod;
+  orient(info.Neck, rot(Y, X, neckA), rot(Z, X, neckA));
+  orient(info.Head, rot(Y, X, headA), rot(Z, X, headA));
+
+  // hands pressed together in front of the chest
+  const chest = bones.Spine2.getWorldPosition(V());
+  const C = chest.clone().add(V(0, -0.13 + breath * 0.004, 0.25));
+  const handDir = V(0, Math.cos(0.75), Math.sin(0.75)); // fingers tipped forward
+  const thumbDir = V(0, Math.sin(0.75), -Math.cos(0.75));
+  for (const s of ['Left', 'Right']) {
+    const sx = s === 'Left' ? 1 : -1;
+    const W = C.clone().addScaledVector(handDir, -0.05).add(V(0.024 * sx, 0, 0));
+    armIK(info, s, W, V(0.8 * sx, -1, -0.5), thumbDir);
+    orient(info[s + 'Hand'], handDir, thumbDir);
+    const palm = V(-sx, 0, 0);
+    // fingers gently curled around each other and the beads
+    const curlAxis = new THREE.Vector3().crossVectors(handDir, palm).normalize();
+    for (const f of ['Index', 'Middle', 'Ring', 'Pinky']) {
+      let d = handDir.clone(), sec = thumbDir.clone();
+      const pinch = s === 'Right' && f === 'Index' ? bead.flick * 0.5 : 0;
+      for (let k = 1; k <= 3; k++) {
+        const a = (f === 'Index' ? 0.12 : 0.22) + pinch;
+        d = rot(d, curlAxis, a); sec = rot(sec, curlAxis, a);
+        orient(info[s + 'Hand' + f + k], d, sec);
+      }
+    }
+    // thumbs along the side of the index finger; the right one passes the beads
+    let td = handDir.clone().multiplyScalar(0.75).addScaledVector(thumbDir, 0.55).addScaledVector(palm, 0.1).normalize();
+    const flick = s === 'Right' ? bead.flick : 0;
+    for (let k = 1; k <= 3; k++) {
+      td = rot(td, curlAxis, 0.1 + flick * 0.35);
+      orient(info[s + 'HandThumb' + k], td, palm);
+    }
+  }
+  bones.Hips.updateMatrixWorld(true);
+  updateRosary(t, bead);
+}
+
+// Two-bone IK in world space: place the elbow on the pole side, then aim upper arm and forearm.
+function armIK(info, side, W, pole, twist) {
+  const up = info[side + 'Arm'], fore = info[side + 'ForeArm'];
+  const S = up.bone.getWorldPosition(V());
+  const L1 = up.len, L2 = fore.len;
+  const toW = W.clone().sub(S);
+  const d = Math.min(toW.length(), L1 + L2 - 1e-3), dir = toW.normalize();
+  const a = (L1 * L1 - L2 * L2 + d * d) / (2 * d), h = Math.sqrt(Math.max(0, L1 * L1 - a * a));
+  const perp = pole.clone().addScaledVector(dir, -pole.dot(dir)).normalize();
+  const E = S.clone().addScaledVector(dir, a).addScaledVector(perp, h);
+  orient(up, E.clone().sub(S), twist);
+  orient(fore, W.clone().sub(E), twist);
+}
+
+// ---------------------------------------------------------------- rosary
+// One bead slips through the fingers per prayer; the whole loop turns with it.
+function beadPhase(t) {
+  const n = t / ROSARY.period, i = Math.floor(n), f = n - i;
+  const slide = smooth(0.0, 0.28, f);
+  const flick = Math.sin(Math.min(1, f / 0.3) * Math.PI);
+  return { s: 2 + i + slide, i, f, flick };
+}
+const beadGeo = new THREE.IcosahedronGeometry(1, 0);
+const beadMat = flat(0x6b3b22, { roughness: 0.45 });
+const beads = new THREE.InstancedMesh(beadGeo, beadMat, ROSARY.beads + 6);
+beads.castShadow = true;
+beads.frustumCulled = false;
+scene.add(beads);
+const silver = flat(0xd0d4da, { metalness: 0.85, roughness: 0.3 });
+const centrepiece = new THREE.Mesh(new THREE.OctahedronGeometry(0.011, 0), silver);
+const cross = new THREE.Group();
+cross.add(new THREE.Mesh(box(0.006, 0.05, 0.004), silver));
+const crossBar = new THREE.Mesh(box(0.03, 0.006, 0.004), silver);
+crossBar.position.y = 0.011;
+cross.add(crossBar);
+const chain = new THREE.LineSegments(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: 0x8a8f96 }));
+scene.add(centrepiece, cross, chain);
+
+const loopCurve = (() => {
+  const half = [[0, 0], [0.018, -0.05], [0.042, -0.12], [0.062, -0.2], [0.07, -0.26], [0.055, -0.31], [0.02, -0.335]];
+  const pts = [...half, ...half.slice(1).reverse().map(([x, y]) => [-x, y])].map(([x, y]) => V(x, y, 0));
+  pts.splice(half.length, 0, V(0, -0.34, 0));
+  const c = new THREE.CatmullRomCurve3(pts, true, 'centripetal');
+  c.arcLengthDivisions = 400;
+  return c;
+})();
+const _mat = new THREE.Matrix4(), _q = new THREE.Quaternion(), _s = V();
+function updateRosary(t, bead) {
+  if (!rig) return;
+  const b = rig.bones;
+  const G = b.LeftHand.getWorldPosition(V()).lerp(b.RightHand.getWorldPosition(V()), 0.5);
+  G.add(V(0, 0.035, 0.03));
+  const sway = Math.sin(t * 0.7) * 0.06 + Math.sin(t * 1.9) * 0.015;
+  const ax = rot(X, Y, 1.15 + sway), az = V().crossVectors(ax, Y);
+  const place = u => {
+    const p = loopCurve.getPointAt(((u % 1) + 1) % 1);
+    const bulge = Math.sin(Math.PI * Math.min(1, -p.y / 0.34)) * 0.03;
+    return G.clone().addScaledVector(ax, p.x).add(V(0, p.y, 0)).addScaledVector(az, -bulge).add(V(0, 0, bulge * 0.6));
+  };
+  const chainPts = [];
+  let prev = null;
+  for (let j = 0; j < ROSARY.beads; j++) {
+    const u = (j + 2 - bead.s) / ROSARY.slots;
+    const p = place(u);
+    const big = j % 11 === 0;
+    _mat.compose(p, _q.identity(), _s.setScalar(big ? 0.0072 : 0.0056));
+    beads.setMatrixAt(j, _mat);
+    if (prev) chainPts.push(prev, p);
+    prev = p;
+  }
+  const mid = place((0.5 - bead.s) / ROSARY.slots);
+  chainPts.push(prev, mid, mid, place((2 - bead.s) / ROSARY.slots));
+  centrepiece.position.copy(mid);
+  centrepiece.rotation.set(0, 1.15 + sway, 0);
+  // pendant hangs straight down from the centre medal
+  const drop = [0.022, 0.042, 0.056, 0.07, 0.09];
+  const swing = V(Math.sin(t * 1.3) * 0.12, -1, Math.cos(t * 0.9) * 0.08).normalize();
+  let last = mid;
+  drop.forEach((d, k) => {
+    const p = mid.clone().addScaledVector(swing, d);
+    _mat.compose(p, _q.identity(), _s.setScalar(k === 0 || k === 4 ? 0.0072 : 0.0056));
+    beads.setMatrixAt(ROSARY.beads + k, _mat);
+    chainPts.push(last, p); last = p;
+  });
+  const crossTop = mid.clone().addScaledVector(swing, 0.108);
+  chainPts.push(last, crossTop);
+  cross.position.copy(mid).addScaledVector(swing, 0.133);
+  cross.quaternion.setFromUnitVectors(V(0, -1, 0), swing).multiply(new THREE.Quaternion().setFromAxisAngle(Y, 1.15 + sway));
+  for (let k = drop.length; k < 6; k++) { _mat.makeScale(0, 0, 0); beads.setMatrixAt(ROSARY.beads + k, _mat); }
+  beads.instanceMatrix.needsUpdate = true;
+  chain.geometry.setFromPoints(chainPts);
+
+  // prayer caption
+  const k = ((bead.i % ROSARY.beads) + ROSARY.beads) % ROSARY.beads, decade = Math.floor(k / 11) + 1, within = k % 11;
+  const text = within === 0 ? `Decade ${decade} · Our Father` : `Decade ${decade} · Hail Mary ${within} of 10`;
+  if (prayerEl.textContent !== text) prayerEl.textContent = text;
+}
+const prayerEl = document.getElementById('prayer');
+
+// ---------------------------------------------------------------- camera
+// A slow orbit around her: close in front and at the sides, pulling out wide (towards the altar) behind her.
+const NUN_FOCUS = V(0, 0.98, 0.15), ALTAR_FOCUS = V(0, 1.4, 5);
+function cinematic(t, pos, look) {
+  const az = 2.5 * Math.sin((Math.PI * 2 * t) / 110);
+  const back = smooth(1.3, 2.2, Math.abs(az));
+  const rFront = 1.35 + 0.9 * (0.5 + 0.5 * Math.sin((Math.PI * 2 * t) / 41 + 0.6));
+  const r = THREE.MathUtils.lerp(rFront, 4.4, back);
+  const h = 1.2 + 0.3 * Math.sin((Math.PI * 2 * t) / 57 + 1) + back * 0.7;
+  pos.set(Math.sin(az) * r, h, NUN_FOCUS.z + Math.cos(az) * r);
+  look.copy(NUN_FOCUS).lerp(ALTAR_FOCUS, back * 0.22);
+  look.y -= (1 - back) * 0.06 * (2.25 - rFront);
+}
+const _look = V();
+let auto = true;
+const camBtn = document.getElementById('camBtn');
+function setAuto(on) {
+  auto = on;
+  controls.enabled = !on;
+  camBtn.textContent = on ? 'Free camera' : 'Cinematic camera';
+  if (!on) controls.target.set(0, 0.95, 0.2);
+}
+camBtn.addEventListener('click', () => setAuto(!auto));
+renderer.domElement.addEventListener('pointerdown', () => { if (auto) setAuto(false); });
+
+// ---------------------------------------------------------------- loop
+const clock = new THREE.Clock();
+let fixedTime = null;
+window.__nun = { setTime: s => { fixedTime = s; }, setCam: (p, t) => { setAuto(false); camera.position.set(...p); controls.target.set(...t); controls.update(); } };
+function frame() {
+  const t = fixedTime ?? clock.getElapsedTime();
+  if (rig) rig.pose(t);
+  for (const f of flames) {
+    const k = 1 + 0.12 * Math.sin(t * 13 + f.seed) + 0.08 * Math.sin(t * 23.7 + f.seed * 2);
+    f.mesh.scale.set(1, k, 1);
+    f.mesh.position.y = f.base + (k - 1) * 0.01;
+  }
+  const fl = (s, a) => 1 + a * (Math.sin(t * 9.1 + s) * 0.6 + Math.sin(t * 15.3 + s * 3) * 0.4);
+  altarGlow.intensity = 2.2 * fl(1, 0.08);
+  votiveGlow.intensity = 1.6 * fl(2, 0.12);
+  statueGlow.intensity = 0.6 * fl(3, 0.12);
+  rayMat.uniforms.uTime.value = t;
+  const dp = dustGeo.attributes.position;
+  for (let i = 0; i < DUST; i++) {
+    const s = dustSeed[i * 4 + 3];
+    dp.setXYZ(i,
+      dustSeed[i * 4] + Math.sin(t * 0.11 + s) * 0.25,
+      dustSeed[i * 4 + 1] + Math.sin(t * 0.07 + s * 1.7) * 0.3 - ((t * 0.02 + s) % 1) * 0.2,
+      dustSeed[i * 4 + 2] + Math.cos(t * 0.09 + s * 0.6) * 0.25);
+  }
+  dp.needsUpdate = true;
+  if (auto) {
+    cinematic(t, camera.position, _look);
+    camera.lookAt(_look);
+  } else controls.update();
+  renderer.render(scene, camera);
+  requestAnimationFrame(frame);
+}
+frame();
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>
